@@ -1,0 +1,18 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main, develop]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev clang-format
+      - name: Code style
+        run: make lint
+      - name: Unit tests (parser)
+        run: make test
+      - name: Build
+        run: if [ -f src/db.c ] && [ -f src/ui.c ] && [ -f src/importer.c ]; then make; else echo "не все модули ещё в ветке — сборку пропускаем"; fi

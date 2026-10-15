@@ -1,0 +1,11 @@
+# Код-стайл проекта (см. CONTRIBUTING.md). Проверка: make lint, автоформат: make format
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+BreakBeforeBraces: Linux          # { функции — на новой строке, остальные — на той же
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortBlocksOnASingleLine: Always
+AllowShortFunctionsOnASingleLine: None
+PointerAlignment: Right           # char *p
+AlignConsecutiveMacros: true
+SortIncludes: false

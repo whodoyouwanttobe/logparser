@@ -1,0 +1,11 @@
+# сборка
+*.o
+logparser
+tests/test_parser
+# редакторы / ОС
+.vscode/
+.idea/
+*.swp
+.DS_Store
+# локальные настройки
+.env
