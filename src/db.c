@@ -16,12 +16,21 @@ PGconn *db_connect(const char *conninfo)
     PGconn *c = PQconnectdb(conninfo ? conninfo : "");
     if (PQstatus(c) != CONNECTION_OK) {
         fprintf(stderr, "db: не удалось подключиться: %s", PQerrorMessage(c));
+        fprintf(stderr, "db: проверьте PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD "
+                        "или запущен ли PostgreSQL (docker compose up -d)\n");
         PQfinish(c);
         return NULL;
     }
     /* служебные NOTICE ("relation already exists") не засоряют вывод */
-    PQexec(c, "SET client_min_messages TO warning");
+    PQclear(PQexec(c, "SET client_min_messages TO warning"));
     return c;
+}
+
+void db_print_target(PGconn *c)
+{
+    const char *host = PQhost(c);
+    printf("подключено: %s:%s/%s (пользователь %s)\n", host && *host ? host : "localhost",
+           PQport(c), PQdb(c), PQuser(c));
 }
 
 int db_exec(PGconn *c, const char *sql)
@@ -57,55 +66,58 @@ int db_apply_schema(PGconn *c, const char *path)
     return rc;
 }
 
-/* ---------- источники ---------- */
+/* ---------- параметризованный запрос без результата ---------- */
 
-int db_source_lock(PGconn *c, const char *path, source_info *out)
+static int exec_params(PGconn *c, const char *sql, int n, const char *const *params)
 {
-    const char *p[1] = {path};
-    PGresult *r =
-        PQexecParams(c, "INSERT INTO sources(path) VALUES ($1) ON CONFLICT (path) DO NOTHING", 1,
-                     NULL, p, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "db: %s", PQerrorMessage(c));
-        PQclear(r);
-        return -1;
-    }
-    PQclear(r);
-
-    r = PQexecParams(
-        c, "SELECT id, coalesce(inode, -1), last_offset FROM sources WHERE path = $1 FOR UPDATE", 1,
-        NULL, p, NULL, NULL, 0);
-    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1) {
-        fprintf(stderr, "db: %s", PQerrorMessage(c));
-        PQclear(r);
-        return -1;
-    }
-    out->id = atoi(PQgetvalue(r, 0, 0));
-    out->inode = atoll(PQgetvalue(r, 0, 1));
-    out->offset = atoll(PQgetvalue(r, 0, 2));
-    PQclear(r);
-    return 0;
-}
-
-int db_source_update(PGconn *c, int id, long long inode, long long offset, long long added)
-{
-    char s_id[16], s_ino[24], s_off[24], s_add[24];
-    snprintf(s_id, sizeof s_id, "%d", id);
-    snprintf(s_ino, sizeof s_ino, "%lld", inode);
-    snprintf(s_off, sizeof s_off, "%lld", offset);
-    snprintf(s_add, sizeof s_add, "%lld", added);
-    const char *p[4] = {s_id, s_ino, s_off, s_add};
-    PGresult *r = PQexecParams(c,
-                               "UPDATE sources SET inode = $2, last_offset = $3, "
-                               "lines_total = lines_total + $4, updated_at = now() WHERE id = $1",
-                               4, NULL, p, NULL, NULL, 0);
-    int ok = PQresultStatus(r) == PGRES_COMMAND_OK;
+    PGresult *r = PQexecParams(c, sql, n, NULL, params, NULL, NULL, 0);
+    ExecStatusType st = PQresultStatus(r);
+    int ok = st == PGRES_COMMAND_OK || st == PGRES_TUPLES_OK;
     if (!ok) fprintf(stderr, "db: %s", PQerrorMessage(c));
     PQclear(r);
     return ok ? 0 : -1;
 }
 
-/* ---------- COPY ---------- */
+/* ---------- попытки импорта ---------- */
+
+int db_source_start(PGconn *c, const char *path, int *id, int *attempt)
+{
+    const char *p[1] = {path};
+    PGresult *r =
+        PQexecParams(c,
+                     "INSERT INTO sources(path, attempt) "
+                     "SELECT $1, coalesce(max(attempt), 0) + 1 FROM sources WHERE path = $1 "
+                     "RETURNING id, attempt",
+                     1, NULL, p, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1) {
+        fprintf(stderr, "db: %s", PQerrorMessage(c));
+        PQclear(r);
+        return -1;
+    }
+    *id = atoi(PQgetvalue(r, 0, 0));
+    *attempt = atoi(PQgetvalue(r, 0, 1));
+    PQclear(r);
+    return 0;
+}
+
+int db_source_finish(PGconn *c, int id, const char *status, const import_counts *n,
+                     const char *error)
+{
+    char s_id[16], s_rd[24], s_in[24], s_dup[24], s_bad[24];
+    snprintf(s_id, sizeof s_id, "%d", id);
+    snprintf(s_rd, sizeof s_rd, "%lld", n->read);
+    snprintf(s_in, sizeof s_in, "%lld", n->inserted);
+    snprintf(s_dup, sizeof s_dup, "%lld", n->duplicate);
+    snprintf(s_bad, sizeof s_bad, "%lld", n->bad);
+    const char *p[7] = {s_id, status, s_rd, s_in, s_dup, s_bad, error};
+    return exec_params(c,
+                       "UPDATE sources SET status = $2, finished_at = now(), lines_read = $3, "
+                       "lines_inserted = $4, lines_duplicate = $5, lines_bad = $6, error = $7 "
+                       "WHERE id = $1",
+                       7, p);
+}
+
+/* ---------- COPY во временную таблицу ---------- */
 
 struct db_copy {
     PGconn *c;
@@ -168,8 +180,12 @@ static void copy_field(db_copy *cp, const char *s, int last)
 
 db_copy *db_copy_begin(PGconn *c)
 {
-    PGresult *r = PQexec(c, "COPY log_entries (ts, host, program, pid, severity, sev_inferred, "
-                            "facility, message, source_id) FROM STDIN");
+    if (db_exec(c, "CREATE TEMP TABLE stage (ts timestamptz, host text, program text, pid int, "
+                   "level text, severity smallint, facility smallint, trace_id text, "
+                   "message text) ON COMMIT DROP") != 0)
+        return NULL;
+
+    PGresult *r = PQexec(c, "COPY stage FROM STDIN");
     if (PQresultStatus(r) != PGRES_COPY_IN) {
         fprintf(stderr, "db: COPY: %s", PQerrorMessage(c));
         PQclear(r);
@@ -182,23 +198,22 @@ db_copy *db_copy_begin(PGconn *c)
     return cp;
 }
 
-int db_copy_row(db_copy *cp, const log_entry *e, int source_id)
+int db_copy_row(db_copy *cp, const log_entry *e)
 {
-    char pid[16], sev[4], fac[4], src[16];
+    char pid[16], sev[4], fac[4];
     snprintf(pid, sizeof pid, "%d", e->pid);
     snprintf(sev, sizeof sev, "%d", e->severity);
     snprintf(fac, sizeof fac, "%d", e->facility);
-    snprintf(src, sizeof src, "%d", source_id);
 
     copy_field(cp, e->ts, 0);
     copy_field(cp, e->host, 0);
     copy_field(cp, e->program, 0);
     copy_field(cp, e->pid >= 0 ? pid : NULL, 0);
-    copy_field(cp, sev, 0);
-    copy_field(cp, e->sev_inferred ? "t" : "f", 0);
+    copy_field(cp, e->level[0] ? e->level : NULL, 0);
+    copy_field(cp, e->severity >= 0 ? sev : NULL, 0);
     copy_field(cp, e->facility >= 0 ? fac : NULL, 0);
-    copy_field(cp, e->message, 0);
-    copy_field(cp, source_id > 0 ? src : NULL, 1);
+    copy_field(cp, e->trace_id[0] ? e->trace_id : NULL, 0);
+    copy_field(cp, e->message, 1);
     return cp->failed ? -1 : 0;
 }
 
@@ -221,21 +236,44 @@ int db_copy_end(db_copy *cp)
     return rc;
 }
 
+long long db_stage_commit(PGconn *c, int source_id)
+{
+    char src[16];
+    snprintf(src, sizeof src, "%d", source_id);
+    const char *p[1] = {src};
+    PGresult *r =
+        PQexecParams(c,
+                     "INSERT INTO log_entries (ts, host, program, pid, level, severity, "
+                     "facility, trace_id, message, source_id) "
+                     "SELECT ts, host, program, pid, level, severity, facility, trace_id, "
+                     "message, $1::int FROM stage ON CONFLICT DO NOTHING",
+                     1, NULL, p, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "db: %s", PQerrorMessage(c));
+        PQclear(r);
+        return -1;
+    }
+    long long n = atoll(PQcmdTuples(r));
+    PQclear(r);
+    return n;
+}
+
 int db_insert_parse_error(PGconn *c, int source_id, long long line_no, const char *raw)
 {
     char s_src[16], s_line[24];
     snprintf(s_src, sizeof s_src, "%d", source_id);
     snprintf(s_line, sizeof s_line, "%lld", line_no);
-    const char *p[3] = {source_id > 0 ? s_src : NULL, s_line, raw};
-    PGresult *r =
-        PQexecParams(c, "INSERT INTO parse_errors(source_id, line_no, raw) VALUES ($1, $2, $3)", 3,
-                     NULL, p, NULL, NULL, 0);
-    int ok = PQresultStatus(r) == PGRES_COMMAND_OK;
-    PQclear(r);
-    return ok ? 0 : -1;
+    const char *p[3] = {s_src, s_line, raw};
+    return exec_params(c, "INSERT INTO parse_errors(source_id, line_no, raw) VALUES ($1, $2, $3)",
+                       3, p);
 }
 
-/* ---------- запросы ---------- */
+int db_clear(PGconn *c)
+{
+    return db_exec(c, "TRUNCATE log_entries, parse_errors, sources RESTART IDENTITY");
+}
+
+/* ---------- построитель запросов ---------- */
 
 int is_relative_time(const char *s)
 {
@@ -245,12 +283,17 @@ int is_relative_time(const char *s)
     return (*s == 's' || *s == 'm' || *s == 'h' || *s == 'd' || *s == 'w') && s[1] == '\0';
 }
 
-/* Построитель запроса: значения пользователя идут только через $N (без SQL-инъекций) */
+/* значения пользователя идут только через $N (без SQL-инъекций) */
 typedef struct {
-    char sql[2048];
+    char sql[4096];
     const char *params[MAX_PARAMS];
     int n;
 } qbuilder;
+
+static void qb_raw(qbuilder *q, const char *s)
+{
+    strncat(q->sql, s, sizeof q->sql - strlen(q->sql) - 1);
+}
 
 static void qb_add(qbuilder *q, const char *fmt, const char *value)
 {
@@ -258,16 +301,16 @@ static void qb_add(qbuilder *q, const char *fmt, const char *value)
     q->params[q->n] = value;
     q->n++;
     snprintf(piece, sizeof piece, fmt, q->n);
-    strncat(q->sql, piece, sizeof q->sql - strlen(q->sql) - 1);
+    qb_raw(q, piece);
 }
 
-static void qb_time(qbuilder *q, const char *op, const char *value)
+static void qb_time(qbuilder *q, const char *col, const char *op, const char *value)
 {
-    char fmt[96];
+    char fmt[128];
     if (is_relative_time(value))
-        snprintf(fmt, sizeof fmt, " AND ts %s now() - $%%d::interval", op);
+        snprintf(fmt, sizeof fmt, " AND %s %s now() - $%%d::interval", col, op);
     else
-        snprintf(fmt, sizeof fmt, " AND ts %s $%%d::timestamptz", op);
+        snprintf(fmt, sizeof fmt, " AND %s %s $%%d::timestamptz", col, op);
     qb_add(q, fmt, value);
 }
 
@@ -282,6 +325,11 @@ static PGresult *run(PGconn *c, const qbuilder *q)
     return r;
 }
 
+#define ENTRY_COLS                                                                                 \
+    "to_char(ts, 'YYYY-MM-DD HH24:MI:SS') AS ts_s, host, coalesce(level, '-') AS level, "          \
+    "severity, coalesce(program, '-') AS program, pid, coalesce(trace_id, '') AS trace_id, "       \
+    "message"
+
 PGresult *db_search(PGconn *c, const search_filter *f)
 {
     qbuilder q = {.n = 0};
@@ -289,58 +337,99 @@ PGresult *db_search(PGconn *c, const search_filter *f)
     snprintf(sev, sizeof sev, "%d", f->max_severity);
     snprintf(lim, sizeof lim, "%d", f->limit > 0 ? f->limit : 50);
 
-    strcpy(q.sql, "SELECT * FROM ("
-                  " SELECT to_char(ts, 'YYYY-MM-DD HH24:MI:SS') AS ts, host,"
-                  " severity, coalesce(program, '-') AS program, pid, message, ts AS ts_raw"
-                  " FROM log_entries WHERE true");
+    qb_raw(&q, "SELECT * FROM (SELECT " ENTRY_COLS ", '' AS offset_s, ts, id "
+               "FROM log_entries WHERE true");
     if (f->max_severity >= 0) qb_add(&q, " AND severity <= $%d::smallint", sev);
+    if (f->level && strcmp(f->level, "-") == 0)
+        qb_raw(&q, " AND level IS NULL");
+    else if (f->level)
+        qb_add(&q, " AND level = lower($%d)", f->level);
     if (f->program) qb_add(&q, " AND program = $%d", f->program);
     if (f->host) qb_add(&q, " AND host = $%d", f->host);
-    if (f->since) qb_time(&q, ">=", f->since);
-    if (f->until) qb_time(&q, "<", f->until);
+    if (f->trace_id) qb_add(&q, " AND trace_id = $%d", f->trace_id);
+    if (f->since) qb_time(&q, "ts", ">=", f->since);
+    if (f->until) qb_time(&q, "ts", "<", f->until);
     if (f->grep) qb_add(&q, " AND message ILIKE '%%' || $%d || '%%'", f->grep);
-    qb_add(&q, " ORDER BY ts_raw DESC, id DESC LIMIT $%d::int", lim);
-    strncat(q.sql, ") t ORDER BY ts_raw", sizeof q.sql - strlen(q.sql) - 1);
+    qb_add(&q, " ORDER BY ts DESC, id DESC LIMIT $%d::int", lim);
+    qb_raw(&q, ") t ORDER BY ts, id");
+    return run(c, &q);
+}
+
+PGresult *db_trace(PGconn *c, const char *trace_id)
+{
+    qbuilder q = {.n = 0};
+    qb_raw(&q, "SELECT " ENTRY_COLS ", "
+               "'+' || to_char(ts - min(ts) OVER (), 'HH24:MI:SS.MS') AS offset_s "
+               "FROM log_entries WHERE trace_id = $1 ORDER BY ts, id");
+    q.params[0] = trace_id;
+    q.n = 1;
     return run(c, &q);
 }
 
 PGresult *db_stats_summary(PGconn *c)
 {
     qbuilder q = {.n = 0};
-    strcpy(q.sql, "SELECT count(*), count(DISTINCT host), count(DISTINCT program),"
-                  " coalesce(to_char(min(ts), 'YYYY-MM-DD HH24:MI'), '-'),"
-                  " coalesce(to_char(max(ts), 'YYYY-MM-DD HH24:MI'), '-'),"
-                  " (SELECT count(*) FROM parse_errors)"
-                  " FROM log_entries");
+    qb_raw(&q, "SELECT count(*), count(DISTINCT host), count(DISTINCT program),"
+               " coalesce(to_char(min(ts), 'YYYY-MM-DD HH24:MI'), '-'),"
+               " coalesce(to_char(max(ts), 'YYYY-MM-DD HH24:MI'), '-'),"
+               " (SELECT count(DISTINCT raw) FROM parse_errors),"
+               " count(DISTINCT trace_id),"
+               " count(*) FILTER (WHERE level IS NULL)"
+               " FROM log_entries");
     return run(c, &q);
 }
 
-PGresult *db_stats_severity(PGconn *c, const char *since)
+/* level, severity, count — включая нестандартные уровни и записи без уровня */
+PGresult *db_stats_levels(PGconn *c, const char *since)
 {
     qbuilder q = {.n = 0};
-    strcpy(q.sql, "SELECT s.code, s.name, count(e.id) FROM severities s"
-                  " LEFT JOIN log_entries e ON e.severity = s.code");
-    if (since) {
-        /* фильтр переносим в условие JOIN, чтобы уровни с нулём тоже остались */
-        if (is_relative_time(since))
-            qb_add(&q, " AND e.ts >= now() - $%d::interval", since);
-        else
-            qb_add(&q, " AND e.ts >= $%d::timestamptz", since);
-    }
-    strcat(q.sql, " GROUP BY s.code, s.name ORDER BY s.code");
+    qb_raw(&q, "SELECT coalesce(level, '-'), min(severity), count(*) FROM log_entries WHERE true");
+    if (since) qb_time(&q, "ts", ">=", since);
+    qb_raw(&q, " GROUP BY level ORDER BY min(severity) NULLS LAST, level NULLS LAST");
     return run(c, &q);
 }
 
+/* программа, ошибок (severity <= 3), предупреждений, всего */
 PGresult *db_stats_programs(PGconn *c, const char *since, int limit)
 {
     qbuilder q = {.n = 0};
     char lim[16];
     snprintf(lim, sizeof lim, "%d", limit);
-    strcpy(q.sql, "SELECT coalesce(program, '-'), count(*) FILTER (WHERE severity <= 3),"
-                  " count(*) FILTER (WHERE severity = 4), count(*)"
-                  " FROM log_entries WHERE true");
-    if (since) qb_time(&q, ">=", since);
-    qb_add(&q, " GROUP BY 1 ORDER BY 2 DESC, 4 DESC LIMIT $%d::int", lim);
+    qb_raw(&q, "SELECT coalesce(program, '-'), count(*) FILTER (WHERE severity <= 3),"
+               " count(*) FILTER (WHERE severity = 4), count(*) FROM log_entries WHERE true");
+    if (since) qb_time(&q, "ts", ">=", since);
+    qb_add(&q, " GROUP BY 1 ORDER BY 2 DESC, 4 DESC, 1 LIMIT $%d::int", lim);
+    return run(c, &q);
+}
+
+PGresult *db_stats_hosts(PGconn *c, const char *since, int limit)
+{
+    qbuilder q = {.n = 0};
+    char lim[16];
+    snprintf(lim, sizeof lim, "%d", limit);
+    qb_raw(&q, "SELECT host, count(*) FILTER (WHERE severity <= 3),"
+               " count(*) FILTER (WHERE severity = 4), count(*) FROM log_entries WHERE true");
+    if (since) qb_time(&q, "ts", ">=", since);
+    qb_add(&q, " GROUP BY 1 ORDER BY 2 DESC, 4 DESC, 1 LIMIT $%d::int", lim);
+    return run(c, &q);
+}
+
+/* самые долгие операции: trace_id, начало, длительность, записей, ошибок, программы */
+PGresult *db_stats_operations(PGconn *c, const char *since, int limit)
+{
+    qbuilder q = {.n = 0};
+    char lim[16];
+    snprintf(lim, sizeof lim, "%d", limit);
+    qb_raw(&q, "SELECT trace_id, to_char(min(ts), 'YYYY-MM-DD HH24:MI:SS'),"
+               " to_char(max(ts) - min(ts), 'HH24:MI:SS.MS'),"
+               " count(*), count(*) FILTER (WHERE severity <= 3),"
+               " string_agg(DISTINCT coalesce(program, '-'), ',')"
+               " FROM log_entries WHERE trace_id IS NOT NULL");
+    if (since) qb_time(&q, "ts", ">=", since);
+    qb_add(&q,
+           " GROUP BY trace_id ORDER BY max(ts) - min(ts) DESC, count(*) DESC"
+           " LIMIT $%d::int",
+           lim);
     return run(c, &q);
 }
 
@@ -350,17 +439,31 @@ PGresult *db_stats_hourly(PGconn *c, int hours)
     char h[16];
     snprintf(h, sizeof h, "%d", hours);
     /* опорная точка — последняя запись, чтобы график был осмысленным и на старых логах */
-    strcpy(q.sql, "WITH last AS (SELECT date_trunc('hour', max(ts)) AS t FROM log_entries),"
-                  " hours AS (SELECT generate_series(last.t - ($1::int - 1) * interval '1 hour',"
-                  "  last.t, interval '1 hour') AS h FROM last)"
-                  " SELECT to_char(hours.h, 'MM-DD HH24:00'),"
-                  "  count(e.id) FILTER (WHERE e.severity <= 3),"
-                  "  count(e.id) FILTER (WHERE e.severity = 4),"
-                  "  count(e.id)"
-                  " FROM hours LEFT JOIN log_entries e"
-                  "  ON e.ts >= hours.h AND e.ts < hours.h + interval '1 hour'"
-                  " GROUP BY hours.h ORDER BY hours.h");
+    qb_raw(&q, "WITH last AS (SELECT date_trunc('hour', max(ts)) AS t FROM log_entries),"
+               " hours AS (SELECT generate_series(last.t - ($1::int - 1) * interval '1 hour',"
+               "  last.t, interval '1 hour') AS h FROM last)"
+               " SELECT to_char(hours.h, 'MM-DD HH24:00'),"
+               "  count(e.id) FILTER (WHERE e.severity <= 3),"
+               "  count(e.id) FILTER (WHERE e.severity = 4),"
+               "  count(e.id)"
+               " FROM hours LEFT JOIN log_entries e"
+               "  ON e.ts >= hours.h AND e.ts < hours.h + interval '1 hour'"
+               " GROUP BY hours.h ORDER BY hours.h");
     q.params[0] = h;
     q.n = 1;
+    return run(c, &q);
+}
+
+/* история попыток импорта */
+PGresult *db_sources(PGconn *c, int limit)
+{
+    qbuilder q = {.n = 0};
+    char lim[16];
+    snprintf(lim, sizeof lim, "%d", limit);
+    qb_add(&q,
+           "SELECT * FROM (SELECT id, path, attempt, to_char(started_at, 'YYYY-MM-DD HH24:MI:SS'),"
+           " status, lines_read, lines_inserted, lines_duplicate, lines_bad,"
+           " coalesce(error, '') FROM sources ORDER BY id DESC LIMIT $%d::int) t ORDER BY id",
+           lim);
     return run(c, &q);
 }

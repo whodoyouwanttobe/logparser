@@ -1,0 +1,43 @@
+# Запуск:  docker compose up -d        — PostgreSQL со схемой logparser
+#          ./lp import /logs/syslog    — утилита в контейнере (lp.cmd на Windows)
+# Остановка: docker compose down       (данные сохраняются)
+#            docker compose down -v    (удалить и данные)
+name: logparser
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-logs}
+      POSTGRES_USER: ${PGUSER:-logparser}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-logparser}
+    ports:
+      - "${PGPORT:-5432}:5432"   # если 5432 занят локальным PostgreSQL — поменяйте PGPORT в .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # схема применяется автоматически при первом старте (пустой том)
+      - ./sql/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  logparser:
+    build: .
+    profiles: ["cli"]            # не стартует по `up`, запускается через `docker compose run`
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGPORT: 5432
+      PGDATABASE: ${PGDATABASE:-logs}
+      PGUSER: ${PGUSER:-logparser}
+      PGPASSWORD: ${PGPASSWORD:-logparser}
+      PGTZ: ${PGTZ:-Asia/Novosibirsk}
+    volumes:
+      - ./logs:/logs:ro            # кладите свои логи в папку logs/
+
+volumes:
+  pgdata:
