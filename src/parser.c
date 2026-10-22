@@ -11,8 +11,27 @@
 static const char *MONTHS[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
-static const char *SEV_NAMES[8] = {"emerg",   "alert",  "crit", "err",
-                                   "warning", "notice", "info", "debug"};
+/* Канонические имена кодов syslog (RFC 5424) */
+static const char *SEV_NAMES[8] = {"emergency", "alert",  "critical", "error",
+                                   "warning",   "notice", "info",     "debug"};
+
+/* Сопоставление обозначений уровней разных программ с кодом syslog.
+ * canonical — как сохраняем в БД. Синонимы с тем же смыслом (err, warn) приводим к одному
+ * имени; самостоятельные уровни (fatal, trace) сохраняем под своим именем, чтобы не терять
+ * информацию, но даём им код для сортировки и фильтра --level. */
+static const struct {
+    const char *name;
+    const char *canonical;
+    int code;
+} LEVELS[] = {
+    {"emergency", "emergency", 0}, {"emerg", "emergency", 0},   {"panic", "emergency", 0},
+    {"alert", "alert", 1},         {"critical", "critical", 2}, {"crit", "critical", 2},
+    {"fatal", "fatal", 2},         {"error", "error", 3},       {"err", "error", 3},
+    {"warning", "warning", 4},     {"warn", "warning", 4},      {"notice", "notice", 5},
+    {"info", "info", 6},           {"information", "info", 6},  {"informational", "info", 6},
+    {"debug", "debug", 7},         {"trace", "trace", 7},
+};
+#define LEVELS_N (sizeof LEVELS / sizeof LEVELS[0])
 
 void parse_ctx_init(parse_ctx *ctx)
 {
@@ -25,7 +44,25 @@ void parse_ctx_init(parse_ctx *ctx)
 
 const char *severity_name(int code)
 {
-    return (code >= 0 && code <= 7) ? SEV_NAMES[code] : "?";
+    return (code >= 0 && code <= 7) ? SEV_NAMES[code] : "-";
+}
+
+int level_normalize(const char *name, size_t len, char out[LEVEL_MAX], int *known)
+{
+    size_t n = len < LEVEL_MAX - 1 ? len : LEVEL_MAX - 1;
+    for (size_t i = 0; i < n; i++)
+        out[i] = (char)tolower((unsigned char)name[i]);
+    out[n] = '\0';
+
+    for (size_t i = 0; i < LEVELS_N; i++) {
+        if (strcmp(out, LEVELS[i].name) == 0) {
+            snprintf(out, LEVEL_MAX, "%s", LEVELS[i].canonical);
+            *known = 1;
+            return LEVELS[i].code;
+        }
+    }
+    *known = 0;
+    return -1; /* нестандартный уровень: сохраняем как есть, без кода */
 }
 
 int severity_from_name(const char *name)
@@ -33,11 +70,10 @@ int severity_from_name(const char *name)
     if (!name || !*name) return -1;
     if (isdigit((unsigned char)name[0]) && name[1] == '\0')
         return (name[0] - '0') <= 7 ? name[0] - '0' : -1;
-    for (int i = 0; i < 8; i++)
-        if (strcasecmp(name, SEV_NAMES[i]) == 0) return i;
-    if (strcasecmp(name, "error") == 0) return 3;
-    if (strcasecmp(name, "warn") == 0) return 4;
-    return -1;
+    char buf[LEVEL_MAX];
+    int known;
+    int code = level_normalize(name, strlen(name), buf, &known);
+    return known ? code : -1;
 }
 
 /* ---------- вспомогательные ---------- */
@@ -56,17 +92,19 @@ static const char *skip_spaces(const char *s)
     return s;
 }
 
-/* регистронезависимый поиск подстроки в первых limit символах */
-static int ci_contains(const char *hay, const char *needle, size_t limit)
+static size_t alpha_len(const char *s)
 {
-    size_t nl = strlen(needle);
-    for (size_t i = 0; hay[i] && i < limit; i++) {
-        size_t j = 0;
-        while (j < nl && hay[i + j] && tolower((unsigned char)hay[i + j]) == needle[j])
-            j++;
-        if (j == nl) return 1;
-    }
-    return 0;
+    size_t n = 0;
+    while (isalpha((unsigned char)s[n]))
+        n++;
+    return n;
+}
+
+static int all_upper(const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        if (!isupper((unsigned char)s[i])) return 0;
+    return 1;
 }
 
 /* <PRI>: facility*8 + severity */
@@ -143,25 +181,76 @@ static const char *parse_iso_ts(const char *s, char *out)
     return p;
 }
 
-/* Эвристика уровня, если в строке нет <PRI> (обычный /var/log/syslog) */
-static int guess_severity(const char *prog, const char *msg)
+/* Явная разметка уровня в начале сообщения:
+ *   [ERROR] ...   <warn> ...   — любое слово из букв в скобках
+ *   FATAL: ...                 — слово ЗАГЛАВНЫМИ с двоеточием
+ *   error: ...                 — известное имя уровня с двоеточием (так пишет, например, sshd)
+ * Возвращает длину имени уровня и его начало в *name, либо 0. */
+static size_t level_prefix(const char *msg, const char **name)
 {
-    const size_t L = 256;
-    if (ci_contains(msg, "panic", L) || ci_contains(msg, "emerg", L)) return 0;
-    if (ci_contains(msg, "critical", L) || ci_contains(msg, "crit:", L) ||
-        ci_contains(msg, "out of memory", L) || ci_contains(msg, "oom-kill", L))
-        return 2;
-    if (ci_contains(msg, "error", L) || ci_contains(msg, "err:", L) ||
-        ci_contains(msg, "fail", L) || ci_contains(msg, "segfault", L) ||
-        ci_contains(msg, "fatal", L))
-        return 3;
-    if (ci_contains(msg, "warn", L) || ci_contains(msg, "invalid user", L) ||
-        ci_contains(msg, "denied", L) || ci_contains(msg, "timeout", L) ||
-        ci_contains(msg, "timed out", L))
-        return 4;
-    if (ci_contains(msg, "notice", L)) return 5;
-    if (ci_contains(msg, "debug", L) || (prog && ci_contains(prog, "debug", 64))) return 7;
-    return 6;
+    if (*msg == '[' || *msg == '<') {
+        char close = *msg == '[' ? ']' : '>';
+        size_t n = alpha_len(msg + 1);
+        if (n > 0 && n < LEVEL_MAX && msg[1 + n] == close) {
+            *name = msg + 1;
+            return n;
+        }
+        return 0;
+    }
+    size_t n = alpha_len(msg);
+    if (n == 0 || n >= LEVEL_MAX || msg[n] != ':') return 0;
+    if (all_upper(msg, n)) {
+        *name = msg;
+        return n;
+    }
+    char buf[LEVEL_MAX];
+    int known;
+    level_normalize(msg, n, buf, &known);
+    if (known) {
+        *name = msg;
+        return n;
+    }
+    return 0;
+}
+
+/* регистронезависимый поиск "key=" на границе слова; возвращает указатель на значение */
+static const char *find_field(const char *msg, const char *key)
+{
+    size_t kl = strlen(key);
+    for (const char *p = msg; *p; p++) {
+        if ((p == msg || !isalnum((unsigned char)p[-1])) && strncasecmp(p, key, kl) == 0 &&
+            p[kl] == '=')
+            return p + kl + 1;
+    }
+    return NULL;
+}
+
+static void extract_level_field(const char *msg, log_entry *e)
+{
+    const char *v = find_field(msg, "level");
+    if (!v) return;
+    if (*v == '"') v++;
+    size_t n = alpha_len(v);
+    if (n == 0 || n >= LEVEL_MAX) return;
+    e->severity = level_normalize(v, n, e->level, &e->level_known);
+}
+
+static void extract_trace_id(const char *msg, log_entry *e)
+{
+    static const char *KEYS[] = {"trace_id", "traceid", "trace-id", "trace"};
+    for (size_t k = 0; k < sizeof KEYS / sizeof KEYS[0]; k++) {
+        const char *v = find_field(msg, KEYS[k]);
+        if (!v) continue;
+        if (*v == '"') v++;
+        size_t n = 0;
+        while (n < TRACE_MAX - 1 && (isalnum((unsigned char)v[n]) || v[n] == '-' || v[n] == '_' ||
+                                     v[n] == '.' || v[n] == ':'))
+            n++;
+        if (n == 0) continue;
+        memcpy(e->trace_id, v, n);
+        e->trace_id[n] = '\0';
+        return;
+    }
 }
 
 /* ---------- основной разбор ---------- */
@@ -174,12 +263,16 @@ int parse_line(const parse_ctx *ctx, char *line, log_entry *e)
         line[--n] = '\0';
     if (n == 0) return -1;
 
+    int pri_sev = -1;
     e->facility = -1;
     e->severity = -1;
+    e->level_known = 0;
+    e->level[0] = '\0';
+    e->trace_id[0] = '\0';
     e->pid = -1;
     e->program = NULL;
 
-    char *p = (char *)parse_pri(line, &e->facility, &e->severity);
+    char *p = (char *)parse_pri(line, &e->facility, &pri_sev);
 
     const char *after = parse_iso_ts(p, e->ts);
     if (!after) after = parse_bsd_ts(ctx, p, e->ts);
@@ -219,11 +312,19 @@ int parse_line(const parse_ctx *ctx, char *line, log_entry *e)
 
     e->message = skip_spaces(p);
 
-    if (e->severity < 0) {
-        e->severity = guess_severity(e->program, e->message);
-        e->sev_inferred = 1;
+    /* уровень: <PRI> -> префикс сообщения -> поле level=; по словам в тексте НЕ угадываем */
+    const char *lv;
+    size_t lvn;
+    if (pri_sev >= 0) {
+        e->severity = pri_sev;
+        e->level_known = 1;
+        snprintf(e->level, LEVEL_MAX, "%s", SEV_NAMES[pri_sev]);
+    } else if ((lvn = level_prefix(e->message, &lv)) > 0) {
+        e->severity = level_normalize(lv, lvn, e->level, &e->level_known);
     } else {
-        e->sev_inferred = 0;
+        extract_level_field(e->message, e);
     }
+
+    extract_trace_id(e->message, e);
     return 0;
 }
