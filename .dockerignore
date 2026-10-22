@@ -3,3 +3,6 @@ logs
 *.o
 logparser
 tests/test_parser
+
+**/*.o
+**/*.dSYM
