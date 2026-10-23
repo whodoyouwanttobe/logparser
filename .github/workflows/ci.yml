@@ -3,16 +3,46 @@ on:
   pull_request:
   push:
     branches: [main, develop]
+
 jobs:
   check:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: logs
+          POSTGRES_USER: logparser
+          POSTGRES_PASSWORD: logparser
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U logparser -d logs"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGDATABASE: logs
+      PGUSER: logparser
+      PGPASSWORD: logparser
+      PGTZ: Asia/Novosibirsk
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libpq-dev clang-format
       - name: Code style
         run: make lint
+      - name: Build
+        run: make
       - name: Unit tests (parser)
         run: make test
-      - name: Build
-        run: if [ -f src/db.c ] && [ -f src/ui.c ] && [ -f src/importer.c ]; then make; else echo "не все модули ещё в ветке — сборку пропускаем"; fi
+      - name: Integration test (PostgreSQL)
+        run: |
+          ./logparser init
+          ./logparser import samples/sample.log samples/app.log
+          ./logparser import samples/sample.log | grep "новых 0"   # повторный импорт без дублей
+          ./logparser search -l error
+          ./logparser trace a1b2c3
+          ./logparser stats
+          ./logparser clear -y
+      - name: Docker Compose config
+        run: docker compose config -q
