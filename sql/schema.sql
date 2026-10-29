@@ -1,7 +1,8 @@
 -- logparser: схема БД (PostgreSQL 13+), версия 0.2
 -- Применение:  ./logparser init   или   psql -f sql/schema.sql
 -- В Docker Compose применяется автоматически при первом запуске контейнера db.
--- Скрипт идемпотентен: можно запускать повторно.
+-- Эта редакция рассчитана на создание новой тестовой базы.
+-- Повторное init не обновляет ограничения существующих таблиц.
 --
 -- Обновление с 0.1.x: структура изменилась несовместимо, базу нужно пересоздать
 --   (docker compose down -v  или  DROP SCHEMA public CASCADE; CREATE SCHEMA public;)
@@ -13,14 +14,12 @@ BEGIN
     END IF;
 END $$;
 
-CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- быстрый поиск подстроки (ILIKE '%...%')
-
 -- Попытки импорта. Одна строка = один запуск `import` для одного файла.
 -- path не уникален: один и тот же файл можно загружать многократно, попытки нумеруются.
 CREATE TABLE IF NOT EXISTS sources (
-    id               serial      PRIMARY KEY,
+    id               integer     GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     path             text        NOT NULL,                 -- путь к файлу или '<stdin>'
-    attempt          integer     NOT NULL DEFAULT 1,       -- номер попытки загрузки этого path
+    attempt          integer     NOT NULL DEFAULT 1 CHECK (attempt > 0), -- номер попытки загрузки этого path
     started_at       timestamptz NOT NULL DEFAULT now(),   -- когда начали обработку
     finished_at      timestamptz,                          -- когда закончили (NULL — идёт или упала)
     status           text        NOT NULL DEFAULT 'running'
@@ -31,7 +30,7 @@ CREATE TABLE IF NOT EXISTS sources (
     lines_bad        integer     NOT NULL DEFAULT 0,       -- не разобраны (см. parse_errors)
     error            text                                  -- текст ошибки, если status = 'failed'
 );
-CREATE INDEX IF NOT EXISTS sources_path ON sources (path, attempt);
+CREATE UNIQUE INDEX IF NOT EXISTS sources_path_attempt_key ON sources (path, attempt);
 
 -- Записи логов
 CREATE TABLE IF NOT EXISTS log_entries (
@@ -48,7 +47,7 @@ CREATE TABLE IF NOT EXISTS log_entries (
     facility   smallint    CHECK (facility BETWEEN 0 AND 23),  -- NULL: нет <PRI>
     trace_id   text,                          -- NULL: запись не относится к трассируемой операции
     message    text        NOT NULL,
-    source_id  integer     REFERENCES sources(id) ON DELETE SET NULL
+    source_id  integer     NOT NULL REFERENCES sources(id) ON DELETE CASCADE
 );
 
 -- Защита от дубликатов: одна и та же строка лога, загруженная повторно, не добавляется.
@@ -56,13 +55,12 @@ CREATE TABLE IF NOT EXISTS log_entries (
 CREATE UNIQUE INDEX IF NOT EXISTS log_entries_uniq ON log_entries
     (ts, host, coalesce(program, ''), coalesce(pid, -1), coalesce(level, ''), md5(message));
 
--- Индексы под запросы CLI
-CREATE INDEX IF NOT EXISTS log_entries_ts_brin  ON log_entries USING brin (ts);
-CREATE INDEX IF NOT EXISTS log_entries_sev_ts   ON log_entries (severity, ts DESC);
-CREATE INDEX IF NOT EXISTS log_entries_level    ON log_entries (level);
-CREATE INDEX IF NOT EXISTS log_entries_prog_ts  ON log_entries (program, ts DESC);
-CREATE INDEX IF NOT EXISTS log_entries_trace    ON log_entries (trace_id, ts) WHERE trace_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS log_entries_msg_trgm ON log_entries USING gin (message gin_trgm_ops);
+-- Минимальный набор под реальные команды, см. docs/indexes.md.
+-- db_search: ORDER BY ts DESC, id DESC LIMIT N (B-tree читается и в обратном порядке).
+CREATE INDEX IF NOT EXISTS log_entries_ts_id ON log_entries (ts, id);
+-- db_trace / search -t: равенство trace_id, затем порядок событий.
+CREATE INDEX IF NOT EXISTS log_entries_trace_ts_id
+    ON log_entries (trace_id, ts, id) WHERE trace_id IS NOT NULL;
 
 -- Строки, которые не удалось разобрать
 CREATE TABLE IF NOT EXISTS parse_errors (
@@ -72,6 +70,10 @@ CREATE TABLE IF NOT EXISTS parse_errors (
     raw         text        NOT NULL,
     created_at  timestamptz NOT NULL DEFAULT now()
 );
+
+-- Индексы дочерних FK помогают находить строки при каскадном удалении попытки.
+CREATE INDEX IF NOT EXISTS log_entries_source ON log_entries(source_id);
+CREATE INDEX IF NOT EXISTS parse_errors_source ON parse_errors(source_id);
 
 -- Представления для отчётов
 CREATE OR REPLACE VIEW v_level_stats AS
@@ -93,9 +95,21 @@ FROM log_entries
 WHERE trace_id IS NOT NULL
 GROUP BY trace_id;
 
--- Удаление старых данных (retention). Пример: SELECT purge_logs('30 days');
+-- Очистка целых завершённых попыток по времени НАЧАЛА ИМПОРТА, не события.
+-- Возвращает число удалённых попыток. running никогда автоматически не удаляется.
 CREATE OR REPLACE FUNCTION purge_logs(keep interval) RETURNS bigint
-LANGUAGE sql AS $$
-    WITH d AS (DELETE FROM log_entries WHERE ts < now() - keep RETURNING 1)
-    SELECT count(*) FROM d;
+LANGUAGE plpgsql AS $$
+DECLARE
+    removed bigint;
+BEGIN
+    IF keep IS NULL OR keep <= interval '0 seconds' THEN
+        RAISE EXCEPTION 'keep должен быть положительным интервалом';
+    END IF;
+    WITH d AS (
+        DELETE FROM sources
+        WHERE status IN ('ok', 'failed') AND started_at < now() - keep
+        RETURNING 1
+    ) SELECT count(*) INTO removed FROM d;
+    RETURN removed;
+END;
 $$;

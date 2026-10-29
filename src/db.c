@@ -82,6 +82,13 @@ static int exec_params(PGconn *c, const char *sql, int n, const char *const *par
 
 int db_source_start(PGconn *c, const char *path, int *id, int *attempt)
 {
+    /* Короткая отдельная транзакция: MAX+1 нельзя вычислять конкурентно.
+     * Блокировка действует только при регистрации, не на время чтения файла. */
+    if (db_exec(c, "BEGIN") != 0) return -1;
+    if (db_exec(c, "LOCK TABLE sources IN SHARE ROW EXCLUSIVE MODE") != 0) {
+        db_exec(c, "ROLLBACK");
+        return -1;
+    }
     const char *p[1] = {path};
     PGresult *r =
         PQexecParams(c,
@@ -92,11 +99,16 @@ int db_source_start(PGconn *c, const char *path, int *id, int *attempt)
     if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1) {
         fprintf(stderr, "db: %s", PQerrorMessage(c));
         PQclear(r);
+        db_exec(c, "ROLLBACK");
         return -1;
     }
     *id = atoi(PQgetvalue(r, 0, 0));
     *attempt = atoi(PQgetvalue(r, 0, 1));
     PQclear(r);
+    if (db_exec(c, "COMMIT") != 0) {
+        db_exec(c, "ROLLBACK");
+        return -1;
+    }
     return 0;
 }
 
@@ -128,6 +140,7 @@ struct db_copy {
 
 static int copy_flush(db_copy *cp)
 {
+    if (cp->failed) return -1;
     if (cp->len == 0) return 0;
     if (PQputCopyData(cp->c, cp->buf, (int)cp->len) != 1) {
         fprintf(stderr, "db: COPY: %s", PQerrorMessage(cp->c));
@@ -140,7 +153,8 @@ static int copy_flush(db_copy *cp)
 
 static void copy_putc(db_copy *cp, char ch)
 {
-    if (cp->len + 1 >= COPY_BUF_SIZE) copy_flush(cp);
+    if (cp->failed) return;
+    if (cp->len + 1 >= COPY_BUF_SIZE && copy_flush(cp) != 0) return;
     cp->buf[cp->len++] = ch;
 }
 
@@ -193,8 +207,15 @@ db_copy *db_copy_begin(PGconn *c)
     }
     PQclear(r);
     db_copy *cp = calloc(1, sizeof *cp);
+    if (cp) cp->buf = malloc(COPY_BUF_SIZE);
+    if (!cp || !cp->buf) {
+        free(cp);
+        PQputCopyEnd(c, "out of memory");
+        while ((r = PQgetResult(c)) != NULL)
+            PQclear(r);
+        return NULL;
+    }
     cp->c = c;
-    cp->buf = malloc(COPY_BUF_SIZE);
     return cp;
 }
 
@@ -271,6 +292,21 @@ int db_insert_parse_error(PGconn *c, int source_id, long long line_no, const cha
 int db_clear(PGconn *c)
 {
     return db_exec(c, "TRUNCATE log_entries, parse_errors, sources RESTART IDENTITY");
+}
+
+/* Возвращает число удалённых попыток, а не событий. */
+long long db_purge(PGconn *c, const char *keep)
+{
+    const char *p[1] = {keep};
+    PGresult *r = PQexecParams(c, "SELECT purge_logs($1::interval)", 1, NULL, p, NULL, NULL, 0);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK || PQntuples(r) != 1) {
+        fprintf(stderr, "db: %s", PQerrorMessage(c));
+        PQclear(r);
+        return -1;
+    }
+    long long n = atoll(PQgetvalue(r, 0, 0));
+    PQclear(r);
+    return n;
 }
 
 /* ---------- построитель запросов ---------- */

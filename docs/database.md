@@ -1,6 +1,6 @@
 # База данных
 
-PostgreSQL 13+. Схема лежит в [`sql/schema.sql`](../sql/schema.sql). В Docker Compose она применяется автоматически при первом запуске.
+Основная проверяемая конфигурация — PostgreSQL 16. Схема лежит в [`sql/schema.sql`](../sql/schema.sql). В Docker Compose она применяется автоматически при первом запуске.
 
 ## ER-диаграмма
 
@@ -12,7 +12,7 @@ erDiagram
     sources ||--o{ parse_errors : "найдены в попытке"
 
     sources {
-        serial id PK "NOT NULL"
+        int id PK "NOT NULL"
         text path "NOT NULL; путь к файлу или <stdin>; не уникален"
         int attempt "NOT NULL; номер попытки загрузки этого path"
         timestamptz started_at "NOT NULL; начало обработки"
@@ -35,7 +35,7 @@ erDiagram
         smallint facility "NULL - нет <PRI>"
         text trace_id "NULL - запись не относится к операции"
         text message "NOT NULL"
-        int source_id FK "NULL - попытка удалена"
+        int source_id FK "NOT NULL; ON DELETE CASCADE"
     }
     parse_errors {
         bigint id PK "NOT NULL"
@@ -84,16 +84,25 @@ CREATE UNIQUE INDEX log_entries_uniq ON log_entries
 
 ## Индексы
 
-| Индекс | Тип | Для чего |
-|---|---|---|
-| `log_entries_uniq` | UNIQUE B-tree | защита от дубликатов |
-| `log_entries_ts_brin` | BRIN (ts) | диапазоны по времени; логи пишутся почти по порядку, поэтому индекс крошечный |
-| `log_entries_sev_ts` | B-tree (severity, ts) | `search -l error -s 1h` |
-| `log_entries_level` | B-tree (level) | `search --level-is fatal`, статистика по уровням |
-| `log_entries_prog_ts` | B-tree (program, ts) | `search -p sshd` |
-| `log_entries_trace` | частичный B-tree (trace_id, ts) | `trace <id>`, самые долгие операции |
-| `log_entries_msg_trgm` | GIN + pg_trgm | `search -g "текст"` (ILIKE '%…%') |
+Базовый набор сокращён. Для списка событий используется B-tree (ts,id), для конкретной операции - частичный B-tree (trace_id,ts,id). Индексы уникальности и source_id остаются. Полный разбор назначения каждого индекса, примеры и ограничения: [indexes.md](indexes.md).
 
 ## Очистка
 
 `logparser clear` выполняет `TRUNCATE log_entries, parse_errors, sources RESTART IDENTITY`. Данные удаляются, а таблицы, индексы и представления остаются, поэтому `init` повторять не нужно. Сервер PostgreSQL при этом не трогается.
+
+
+## Исправления после созвона
+
+sources.id использует GENERATED ALWAYS AS IDENTITY, как идентификаторы остальных таблиц. UNIQUE-индекс sources_path_attempt_key защищает (path,attempt), CHECK требует положительный attempt. db_source_start открывает короткую транзакцию и берёт SHARE ROW EXCLUSIVE на sources перед MAX+1. Это простой компромисс для учебной утилиты: регистрации сериализованы, но чтение файлов и COPY идут после освобождения блокировки. Одного UNIQUE без синхронизации недостаточно для успешной конкурентной регистрации.
+
+source_id в log_entries теперь NOT NULL и ON DELETE CASCADE. Индексы log_entries_source и parse_errors_source поддерживают поиск дочерних строк при удалении. purge_logs(keep) удаляет целые завершённые попытки по started_at и возвращает число попыток. running не удаляются. clear сохраняет прежнюю семантику полной очистки.
+
+Дедупликация глобальна: событие принадлежит первой вставившей его попытке. История последующего импорта с 19 дублями не содержит 19 резервных событий. После удаления владельца запись исчезнет, а повторный импорт сможет добавить её заново. Это нужно согласовать с преподавателем; если требуется сохранять событие до удаления всех импортов, нужна отдельная связь многие-ко-многим, которой здесь нет.
+
+## Обновление существующего тома
+
+Docker init-скрипт выполняется только для пустого тома. Пересборка образа не обновляет существующие таблицы. В этой учебной версии используем новую тестовую базу: порядок пересоздания приведён в README, раздел «Создание новой тестовой базы». Старые логи и история при удалении тестового тома теряются.
+
+## Проверка пользы индексов
+
+См. [indexes.md](indexes.md) и [sql/check_indexes.sql](../sql/check_indexes.sql). Нужный набор индексов создаётся вместе с новой базой из schema.sql. check_indexes.sql нужен только для диагностики и не требуется для запуска приложения.
