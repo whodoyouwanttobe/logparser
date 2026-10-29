@@ -21,7 +21,9 @@ static int use_color = 0;
 #define C_BGRED  (use_color ? "\033[1;41;97m" : "")
 
 void ui_init(void)
-{ use_color = isatty(STDOUT_FILENO) && getenv("NO_COLOR") == NULL; }
+{
+    use_color = isatty(STDOUT_FILENO) && getenv("NO_COLOR") == NULL;
+}
 
 /* printf("%-Ns") считает байты, а кириллица в UTF-8 — 2 байта на символ.
  * Печатаем строку и добиваем пробелами по числу символов. */
