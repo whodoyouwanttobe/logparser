@@ -6,7 +6,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16-alpine
@@ -28,9 +28,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev clang-format
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev postgresql-client clang-format-18
       - name: Code style
-        run: make lint
+        run: make lint CLANG_FORMAT=clang-format-18
       - name: Build
         run: make
       - name: Unit tests (parser)
