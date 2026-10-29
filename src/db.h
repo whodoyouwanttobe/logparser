@@ -38,6 +38,8 @@ long long db_stage_commit(PGconn *c, int source_id); /* число новых з
 int db_insert_parse_error(PGconn *c, int source_id, long long line_no, const char *raw);
 int db_clear(PGconn *c); /* удалить все данные, структуру сохранить */
 
+long long db_purge(PGconn *c, const char *keep); /* число удалённых попыток или -1 */
+
 /* ---- запросы для CLI ---- */
 typedef struct {
     int max_severity;  /* -1 => любой; иначе severity <= max_severity */
