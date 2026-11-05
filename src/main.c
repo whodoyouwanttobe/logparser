@@ -8,6 +8,7 @@
 #include "importer.h"
 #include "parser.h"
 #include "ui.h"
+#include "view.h"
 
 #define VERSION "0.2.0"
 
@@ -29,6 +30,7 @@ static void usage(FILE *out)
         "  import FILE...             загрузить логи; FILE = '-' — читать stdin.\n"
         "                             Повторная загрузка того же файла не создаёт дубликатов\n"
         "  parse [-n N] FILE          разобрать без БД и показать поля (проверка формата)\n"
+        "  view                       интерактивный просмотр журнала и операций\n"
         "  search [фильтры]           найти записи\n"
         "      -l, --level LEVEL      уровень не ниже: emergency alert critical error warning\n"
         "                             notice info debug (или код 0..7)\n"
@@ -345,6 +347,16 @@ int main(int argc, char **argv)
     char **sub_argv = argv + i;
     optind = 1;
 
+    if (strcmp(cmd, "view") == 0) {
+        if (sub_argc != 1) {
+            ui_error("использование: logparser view");
+            return 1;
+        }
+        PGconn *c = connect_or_die();
+        int rc = view_logs(c);
+        PQfinish(c);
+        return rc;
+    }
     if (strcmp(cmd, "init") == 0) return cmd_init(sub_argc, sub_argv);
     if (strcmp(cmd, "import") == 0) return cmd_import(sub_argc, sub_argv);
     if (strcmp(cmd, "parse") == 0) return cmd_parse(sub_argc, sub_argv);

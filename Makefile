@@ -8,7 +8,7 @@ PG_LIB  := $(shell pg_config --libdir 2>/dev/null)
 LDFLAGS += -L$(PG_LIB)
 LDLIBS  += -lpq
 
-SRC := src/parser.c src/db.c src/importer.c src/ui.c src/main.c
+SRC := src/parser.c src/db.c src/importer.c src/ui.c src/view.c src/main.c
 OBJ := $(SRC:.c=.o)
 
 .PHONY: all test clean format lint
