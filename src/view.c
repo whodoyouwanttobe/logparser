@@ -66,6 +66,8 @@ int view_logs(PGconn *c)
             }
         }
         printf("\nЗаписей: %d  |  Страница %d/%d\n\n", n, page + 1, pages);
+        if (!trace)
+            printf("Журнал ограничен последними %d записями по текущему фильтру.\n", LIMIT);
         fputs("    №   ", stdout);
         column(trace ? "ОТ НАЧАЛА" : "ВРЕМЯ", trace ? 14 : 20);
         column("УРОВЕНЬ", 10);
