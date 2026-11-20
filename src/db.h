@@ -58,6 +58,7 @@ typedef struct {
 PGresult *db_search(PGconn *c, const search_filter *f);
 PGresult *db_trace(PGconn *c, const char *trace_id);
 
+PGresult *db_analyze(PGconn *c);
 PGresult *db_stats_summary(PGconn *c);
 PGresult *db_stats_levels(PGconn *c, const char *since);
 PGresult *db_stats_programs(PGconn *c, const char *since, int limit);
