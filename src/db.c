@@ -503,3 +503,12 @@ PGresult *db_sources(PGconn *c, int limit)
            lim);
     return run(c, &q);
 }
+
+/* Columns: rule, host, program, trace, first, last, evidence count. */
+PGresult *db_analyze(PGconn *c)
+{
+    qbuilder q = {.n = 0};
+    qb_raw(&q, "SELECT rule, host, program, coalesce(trace_id, '-'), first_ts, last_ts, n "
+               "FROM v_analytics ORDER BY last_ts DESC, rule, host, program, trace_id LIMIT 50");
+    return run(c, &q);
+}

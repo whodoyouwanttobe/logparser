@@ -113,3 +113,28 @@ BEGIN
     RETURN removed;
 END;
 $$;
+
+-- Анализ всех импортированных событий. Правила описаны в docs/analyze.md.
+CREATE OR REPLACE VIEW v_analytics AS
+WITH db_repeats AS (
+    SELECT host, program, min(ts) AS first_ts, max(ts) AS last_ts, count(*) AS n
+    FROM log_entries
+    WHERE severity <= 3 AND program IS NOT NULL
+      AND message ~* '(^|[^[:alnum:]_])SQLSTATE[ =:]+08006([^[:alnum:]_]|$)'
+    GROUP BY host, program, floor(extract(epoch FROM ts) / 300)
+    HAVING count(*) >= 3
+), aborted AS (
+    SELECT e.host, e.program, e.trace_id, e.ts AS last_ts, e.id,
+           (SELECT max(p.ts) FROM log_entries p
+            WHERE p.trace_id = e.trace_id AND p.host = e.host AND p.program = e.program
+              AND p.severity <= 3 AND p.message ILIKE '%Inventory service unavailable%'
+              AND p.ts >= e.ts - interval '60 seconds' AND p.ts < e.ts) AS first_ts
+    FROM log_entries e
+    WHERE e.trace_id IS NOT NULL AND e.severity <= 3
+      AND e.message ILIKE '%Checkout aborted after retries%'
+)
+SELECT 'DB_LINK'::text AS rule, host, program, NULL::text AS trace_id, first_ts, last_ts, n
+FROM db_repeats
+UNION ALL
+SELECT 'CHECKOUT_CHAIN', host, program, trace_id, first_ts, last_ts, 2::bigint
+FROM aborted WHERE first_ts IS NOT NULL;
