@@ -53,6 +53,7 @@ static void usage(FILE *out)
         "      --hours N              только график: N часов до часа последней записи включительно "
         "(по умолчанию 12)\n"
         "      --top N                до N строк в каждом рейтинге (по умолчанию 5)\n"
+        "  analyze                    до 50 последних диагностических выводов по всей базе\n"
         "  sources [-n N]             история попыток импорта\n"
         "  clear [-y]                 удалить все загруженные данные (структура БД остаётся)\n"
         "\n"
@@ -354,6 +355,21 @@ int main(int argc, char **argv)
         }
         PGconn *c = connect_or_die();
         int rc = view_logs(c);
+        PQfinish(c);
+        return rc;
+    }
+    if (strcmp(cmd, "analyze") == 0) {
+        if (sub_argc != 1) {
+            ui_error("использование: logparser analyze");
+            return 1;
+        }
+        PGconn *c = connect_or_die();
+        PGresult *r = db_analyze(c);
+        int rc = r ? 0 : 1;
+        if (r) {
+            ui_print_findings(r);
+            PQclear(r);
+        }
         PQfinish(c);
         return rc;
     }
