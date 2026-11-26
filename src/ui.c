@@ -350,3 +350,20 @@ void ui_print_import(const char *path, const import_stats *st)
                 "фильтр: search --level-is %s",
                 st->odd[i].name, st->odd[i].count, st->odd[i].name);
 }
+
+void ui_print_findings(PGresult *r)
+{
+    if (!PQntuples(r)) puts("Совпадений с двумя правилами не найдено.");
+    for (int i = 0; i < PQntuples(r); i++) {
+        const char *rule = PQgetvalue(r, i, 0);
+        printf("%s | %s / %s | trace=%s | %s — %s | событий: %s\n", rule, PQgetvalue(r, i, 1),
+               PQgetvalue(r, i, 2), PQgetvalue(r, i, 3), PQgetvalue(r, i, 4), PQgetvalue(r, i, 5),
+               PQgetvalue(r, i, 6));
+        if (strcmp(rule, "DB_LINK") == 0)
+            puts(
+                "Повтор SQLSTATE 08006. Проверьте соединение с БД и журнал сервера в этот период.");
+        else if (strcmp(rule, "CHECKOUT_CHAIN") == 0)
+            puts("За недоступностью Inventory последовала отмена заказа. Проверьте доступность "
+                 "сервиса и повторы запроса.");
+    }
+}

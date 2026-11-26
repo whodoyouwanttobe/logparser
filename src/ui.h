@@ -25,4 +25,6 @@ void ui_error(const char *fmt, ...);
 void ui_warn(const char *fmt, ...);
 void ui_ok(const char *fmt, ...);
 
+void ui_print_findings(PGresult *r);
+
 #endif
