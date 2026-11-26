@@ -1,0 +1,140 @@
+Планы запросов к индексам БД logparser 0.2
+
+Код: ветка test/db-contracts-normalization, коммит 1362349f2374b5b6c8f8c4220f2ecf921200e5ca
+     (sql/schema.sql и src/db.c в этом коммите не изменялись).
+Сервер: PostgreSQL 18.3 on x86_64-windows, одноразовая локальная тестовая база
+     logparser_contract_20261126, ОС Windows.
+Данные: samples/sample.log (2 попытки импорта) и samples/app.log (1 попытка):
+     log_entries — 34 события, sources — 3 попытки, parse_errors — 2 строки.
+Дата снятия: 2026-11-26, PGTZ Asia/Novosibirsk.
+
+Ограничение эксперимента: набор мал (34 события), поэтому во всех планах
+планировщик выбирает Seq Scan. Это ожидаемо и не говорит о неэффективности
+индексов. Замер на представительном наборе не выполнялся, ускорение поиска
+от индексов не заявляется. Последние три плана показывают вид запросов без
+специализированных индексов (severity, program, ILIKE по сообщению).
+
+Ниже — фактический вывод sql/check_indexes.sql: ANALYZE, перечень индексов,
+статистика pg_stat_user_indexes и планы EXPLAIN (ANALYZE, BUFFERS).
+
+========================================================================
+ANALYZE
+ANALYZE
+ANALYZE
+        indexname         |                                                                                       indexdef
+--------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ log_entries_pkey         | CREATE UNIQUE INDEX log_entries_pkey ON public.log_entries USING btree (id)
+ log_entries_source       | CREATE INDEX log_entries_source ON public.log_entries USING btree (source_id)
+ log_entries_trace_ts_id  | CREATE INDEX log_entries_trace_ts_id ON public.log_entries USING btree (trace_id, ts, id) WHERE (trace_id IS NOT NULL)
+ log_entries_ts_id        | CREATE INDEX log_entries_ts_id ON public.log_entries USING btree (ts, id)
+ log_entries_uniq         | CREATE UNIQUE INDEX log_entries_uniq ON public.log_entries USING btree (ts, host, COALESCE(program, ''::text), COALESCE(pid, '-1'::integer), COALESCE(level, ''::text), md5(message))
+ parse_errors_pkey        | CREATE UNIQUE INDEX parse_errors_pkey ON public.parse_errors USING btree (id)
+ parse_errors_source      | CREATE INDEX parse_errors_source ON public.parse_errors USING btree (source_id)
+ sources_path_attempt_key | CREATE UNIQUE INDEX sources_path_attempt_key ON public.sources USING btree (path, attempt)
+ sources_pkey             | CREATE UNIQUE INDEX sources_pkey ON public.sources USING btree (id)
+(9 строк)
+
+   relname    |       indexrelname       | idx_scan | index_size
+--------------+--------------------------+----------+------------
+ log_entries  | log_entries_pkey         |       55 | 16 kB
+ log_entries  | log_entries_source       |        3 | 16 kB
+ log_entries  | log_entries_trace_ts_id  |        0 | 16 kB
+ log_entries  | log_entries_ts_id        |        0 | 16 kB
+ log_entries  | log_entries_uniq         |       54 | 16 kB
+ parse_errors | parse_errors_pkey        |        0 | 16 kB
+ parse_errors | parse_errors_source      |        2 | 16 kB
+ sources      | sources_path_attempt_key |        3 | 16 kB
+ sources      | sources_pkey             |       43 | 16 kB
+(9 строк)
+
+                                                       QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=2.20..2.29 rows=34 width=109) (actual time=0.021..0.024 rows=34.00 loops=1)
+   Buffers: shared hit=1
+   ->  Sort  (cost=2.20..2.29 rows=34 width=109) (actual time=0.019..0.020 rows=34.00 loops=1)
+         Sort Key: ts DESC, id DESC
+         Sort Method: quicksort  Memory: 32kB
+         Buffers: shared hit=1
+         ->  Seq Scan on log_entries  (cost=0.00..1.34 rows=34 width=109) (actual time=0.005..0.007 rows=34.00 loops=1)
+               Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=83
+ Planning Time: 0.291 ms
+ Execution Time: 0.033 ms
+(12 строк)
+
+                                                   QUERY PLAN
+----------------------------------------------------------------------------------------------------------------
+ Sort  (cost=1.48..1.50 rows=5 width=109) (actual time=0.009..0.009 rows=5.00 loops=1)
+   Sort Key: ts, id
+   Sort Method: quicksort  Memory: 25kB
+   Buffers: shared hit=1
+   ->  Seq Scan on log_entries  (cost=0.00..1.43 rows=5 width=109) (actual time=0.006..0.007 rows=5.00 loops=1)
+         Filter: (trace_id = 'a1b2c3'::text)
+         Rows Removed by Filter: 29
+         Buffers: shared hit=1
+ Planning Time: 0.051 ms
+ Execution Time: 0.015 ms
+(10 строк)
+
+                                                QUERY PLAN
+----------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1.04..1.05 rows=1 width=4) (actual time=0.012..0.013 rows=1.00 loops=1)
+   Buffers: shared hit=1
+   ->  Seq Scan on sources  (cost=0.00..1.04 rows=2 width=4) (actual time=0.006..0.007 rows=2.00 loops=1)
+         Filter: (path = 'samples/sample.log'::text)
+         Rows Removed by Filter: 1
+         Buffers: shared hit=1
+ Planning:
+   Buffers: shared hit=20
+ Planning Time: 0.187 ms
+ Execution Time: 0.029 ms
+(10 строк)
+
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=1.50..1.52 rows=6 width=109) (actual time=0.010..0.011 rows=6.00 loops=1)
+   Buffers: shared hit=1
+   ->  Sort  (cost=1.50..1.52 rows=6 width=109) (actual time=0.009..0.009 rows=6.00 loops=1)
+         Sort Key: ts DESC, id DESC
+         Sort Method: quicksort  Memory: 26kB
+         Buffers: shared hit=1
+         ->  Seq Scan on log_entries  (cost=0.00..1.43 rows=6 width=109) (actual time=0.005..0.006 rows=6.00 loops=1)
+               Filter: (severity <= 3)
+               Rows Removed by Filter: 28
+               Buffers: shared hit=1
+ Planning Time: 0.046 ms
+ Execution Time: 0.018 ms
+(12 строк)
+
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=1.47..1.48 rows=4 width=109) (actual time=0.008..0.009 rows=4.00 loops=1)
+   Buffers: shared hit=1
+   ->  Sort  (cost=1.47..1.48 rows=4 width=109) (actual time=0.008..0.008 rows=4.00 loops=1)
+         Sort Key: ts DESC, id DESC
+         Sort Method: quicksort  Memory: 26kB
+         Buffers: shared hit=1
+         ->  Seq Scan on log_entries  (cost=0.00..1.43 rows=4 width=109) (actual time=0.004..0.006 rows=4.00 loops=1)
+               Filter: (program = 'sshd'::text)
+               Rows Removed by Filter: 30
+               Buffers: shared hit=1
+ Planning Time: 0.038 ms
+ Execution Time: 0.014 ms
+(12 строк)
+
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=1.45..1.46 rows=3 width=109) (actual time=0.018..0.019 rows=4.00 loops=1)
+   Buffers: shared hit=1
+   ->  Sort  (cost=1.45..1.46 rows=3 width=109) (actual time=0.018..0.018 rows=4.00 loops=1)
+         Sort Key: ts DESC, id DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=1
+         ->  Seq Scan on log_entries  (cost=0.00..1.43 rows=3 width=109) (actual time=0.006..0.016 rows=4.00 loops=1)
+               Filter: (message ~~* '%failed%'::text)
+               Rows Removed by Filter: 30
+               Buffers: shared hit=1
+ Planning Time: 0.067 ms
+ Execution Time: 0.027 ms
+(12 строк)

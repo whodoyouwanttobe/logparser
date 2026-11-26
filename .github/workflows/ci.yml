@@ -43,6 +43,7 @@ jobs:
           ./logparser search -l error
           ./logparser trace a1b2c3
           ./logparser stats
+          psql -X -v ON_ERROR_STOP=1 -f tests/db_contract.sql
           ./logparser clear -y
       - name: Docker Compose config
         run: docker compose config -q
