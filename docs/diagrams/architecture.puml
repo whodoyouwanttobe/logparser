@@ -1,0 +1,24 @@
+@startuml
+!pragma layout smetana
+skinparam dpi 200
+skinparam monochrome true
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam defaultFontSize 16
+top to bottom direction
+actor "Пользователь" as U
+component "main.c\nКоманды и параметры" as M
+component "importer.c\nЧтение файла и загрузка" as I
+component "parser.c\nРазбор одной строки" as P
+component "db.c\nlibpq и SQL" as D
+component "ui.c\nТаблицы и CSV" as V
+database "PostgreSQL\nsources, log_entries, parse_errors" as B
+U --> M
+M --> I : import / parse
+I --> P : строка
+I --> D : записи и счётчики
+M --> D : search / trace / stats
+D --> B
+M --> V : результаты запроса
+V --> U : вывод
+@enduml

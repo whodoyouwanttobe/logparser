@@ -1,0 +1,15 @@
+2026-10-10T10:00:00.000+07:00 api01 shop-api[4242]: [INFO] trace_id=a1b2c3 Request started: POST /orders
+2026-10-10T10:00:00.120+07:00 api01 shop-api[4242]: [DEBUG] trace_id=a1b2c3 Validating order payload
+2026-10-10T10:00:01.050+07:00 db01 postgres[880]: [INFO] trace_id=a1b2c3 Database query: INSERT INTO orders
+2026-10-10T10:00:02.400+07:00 api01 shop-api[4242]: [WARN] trace_id=a1b2c3 Payment gateway slow: 1300 ms
+2026-10-10T10:00:03.000+07:00 api01 shop-api[4242]: [INFO] trace_id=a1b2c3 Request completed: 201 Created
+2026-10-10T10:00:05.000+07:00 api01 shop-api[4243]: [INFO] trace_id=d4e5f6 Request started: GET /orders/77
+2026-10-10T10:00:05.080+07:00 db01 postgres[880]: [INFO] trace_id=d4e5f6 Database query: SELECT order 77
+2026-10-10T10:00:05.150+07:00 api01 shop-api[4243]: [INFO] trace_id=d4e5f6 Request completed: 200 OK
+2026-10-10T10:01:00.000+07:00 api01 shop-api[4244]: [INFO] trace_id=f7a8b9 Request started: POST /checkout
+2026-10-10T10:01:00.500+07:00 api01 shop-api[4244]: [ERROR] trace_id=f7a8b9 Inventory service unavailable
+2026-10-10T10:01:09.800+07:00 api01 shop-api[4244]: FATAL: trace_id=f7a8b9 Checkout aborted after retries
+2026-10-10T10:02:00.000+07:00 api01 shop-api[4245]: [TRACE] trace_id=c0ffee Cache lookup user:15
+2026-10-10T10:02:00.004+07:00 api01 shop-api[4245]: [TRACE] trace_id=c0ffee Cache hit user:15
+2026-10-10T10:03:00.000+07:00 worker01 billing[777]: [AUDIT] Invoice 2026-1001 exported
+2026-10-10T10:04:00.000+07:00 worker01 billing[777]: Nightly job finished in 42s

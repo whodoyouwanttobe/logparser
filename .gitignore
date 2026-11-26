@@ -9,3 +9,6 @@ tests/test_parser
 .DS_Store
 # локальные настройки
 .env
+
+# отладочные символы macOS
+*.dSYM/

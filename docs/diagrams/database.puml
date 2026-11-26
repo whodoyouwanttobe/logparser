@@ -1,0 +1,46 @@
+@startuml
+!pragma layout smetana
+skinparam dpi 200
+skinparam monochrome true
+skinparam shadowing false
+skinparam defaultFontName Arial
+skinparam defaultFontSize 16
+hide circle
+top to bottom direction
+entity sources {
+ * id : integer <<PK>>
+ --
+ * path : text
+ * attempt : integer
+ * started_at : timestamptz
+ finished_at : timestamptz
+ * status : text
+ * lines_read / inserted / duplicate / bad : integer
+ error : text
+ --
+ UNIQUE (path, attempt)
+}
+entity log_entries {
+ * id : bigint <<PK>>
+ --
+ * ts : timestamptz
+ * host : text
+ program : text
+ pid : integer
+ level : text
+ severity / facility : smallint
+ trace_id : text
+ * message : text
+ * source_id : integer <<FK>>
+}
+entity parse_errors {
+ * id : bigint <<PK>>
+ --
+ * source_id : integer <<FK>>
+ * line_no : bigint
+ * raw : text
+ * created_at : timestamptz
+}
+sources ||--o{ log_entries : "ON DELETE CASCADE"
+sources ||--o{ parse_errors : "ON DELETE CASCADE"
+@enduml
